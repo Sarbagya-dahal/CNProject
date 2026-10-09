@@ -1,0 +1,20 @@
+[package]
+name = "vfsd-filter"
+version = "0.1.0"
+edition = "2021"
+authors = ["Sarbagya Dahal"]
+description = "Host-side request-validation security filter layer for virtiofsd"
+license = "Apache-2.0"
+repository = "https://github.com/Sarbagya-dahal/vfsd-filter"
+readme = "README.md"
+keywords = ["virtiofsd", "virtio-fs", "security", "filter", "kata-containers"]
+
+[lib]
+name = "vfsd_filter"
+path = "src/lib.rs"
+
+[dependencies]
+virtiofsd = { git = "https://gitlab.com/virtio-fs/virtiofsd.git", rev = "c2540f8db14caba81c1e37fba23fc7bf2cd7f0dd" }
+libc = "0.2"
+serde = { version = "1.0", features = ["derive"] }
+toml = { version = "0.8", features = ["parse"] }
