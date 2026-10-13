@@ -1,6 +1,6 @@
 ﻿# vfsd-filter
 
-A host-side **request-validation security filter** library for [virtiofsd](https://gitlab.com/virtio-fs/virtiofsd), the Rust virtio-fs vhost-user device daemon.
+A host-side **request-validation security filter** library for [virtiofsd], the Rust virtio-fs vhost-user device daemon.
 
 ## What it is
 
