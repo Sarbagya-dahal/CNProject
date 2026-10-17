@@ -440,10 +440,22 @@ where
         }
     }
 
-    // ── Group C: readlink ─────────────────────────────────────────────────────
+    // ── Group B: readlink — enforce the read policy ────────────────────────────
 
     fn readlink(&self, ctx: Context, inode: Self::Inode) -> io::Result<Vec<u8>> {
-        self.inner.readlink(ctx, inode)
+        let start = Instant::now();
+        let inode_raw: u64 = inode.into();
+        let verdict = self.policy.check_op(OP_READ);
+        let latency = Self::elapsed_ns(start);
+
+        self.audit.log(
+            &ctx, OpKind::Readlink, 0, inode_raw, b"", &verdict, latency,
+        );
+
+        match verdict {
+            Verdict::Allow => self.inner.readlink(ctx, inode),
+            Verdict::Deny { errno, .. } => Err(Self::deny_err(errno)),
+        }
     }
 
     // ── Group A: symlink — op + target + name checks ──────────────────────────
@@ -626,17 +638,31 @@ where
         }
     }
 
-    // ── Group C: opendir, readdir, releasedir (readdirplus handled by server via readdir) ────────────────────
+    // ── Directory operations ───────────────────────────────────────────────────
 
+    // Enforce allow_open before forwarding directory-open requests.
     fn opendir(
         &self,
         ctx: Context,
         inode: Self::Inode,
         flags: u32,
     ) -> io::Result<(Option<Self::Handle>, OpenOptions)> {
-        self.inner.opendir(ctx, inode, flags)
+        let start = Instant::now();
+        let inode_raw: u64 = inode.into();
+        let verdict = self.policy.check_op(OP_OPEN);
+        let latency = Self::elapsed_ns(start);
+
+        self.audit.log(
+            &ctx, OpKind::Opendir, 0, inode_raw, b"", &verdict, latency,
+        );
+
+        match verdict {
+            Verdict::Allow => self.inner.opendir(ctx, inode, flags),
+            Verdict::Deny { errno, .. } => Err(Self::deny_err(errno)),
+        }
     }
 
+    // Enforce allow_read before forwarding directory-read requests.
     fn readdir(
         &self,
         ctx: Context,
@@ -645,7 +671,19 @@ where
         size: u32,
         offset: u64,
     ) -> io::Result<Self::DirIter> {
-        self.inner.readdir(ctx, inode, handle, size, offset)
+        let start = Instant::now();
+        let inode_raw: u64 = inode.into();
+        let verdict = self.policy.check_op(OP_READ);
+        let latency = Self::elapsed_ns(start);
+
+        self.audit.log(
+            &ctx, OpKind::Readdir, 0, inode_raw, b"", &verdict, latency,
+        );
+
+        match verdict {
+            Verdict::Allow => self.inner.readdir(ctx, inode, handle, size, offset),
+            Verdict::Deny { errno, .. } => Err(Self::deny_err(errno)),
+        }
     }
 
 
@@ -776,4 +814,221 @@ where
     fn deserialize_and_apply(&self, state_pipe: File) -> io::Result<()> {
         self.inner.deserialize_and_apply(state_pipe)
     }
+}
+
+#[cfg(test)]
+mod forwarding_regression_tests {
+    use super::FilteredFs;
+    use virtiofsd::filesystem::{
+        Context, DirEntry, DirectoryIterator, Entry, Extensions, FileSystem, OpenOptions,
+    };
+    use crate::filter::audit::AuditLogger;
+    use crate::filter::config::FilterConfig;
+    use crate::filter::policy::PolicyEngine;
+    use std::ffi::CStr;
+    use std::io;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    struct EmptyDirIter;
+
+    impl DirectoryIterator for EmptyDirIter {
+        fn next(&mut self) -> Option<DirEntry<'_>> {
+            None
+        }
+    }
+
+    struct RecordingFs {
+        symlink_called: Arc<AtomicBool>,
+        readlink_called: Arc<AtomicBool>,
+        opendir_called: Arc<AtomicBool>,
+        readdir_called: Arc<AtomicBool>,
+    }
+
+    impl FileSystem for RecordingFs {
+        type Inode = u64;
+        type Handle = u64;
+        type DirIter = EmptyDirIter;
+
+        fn symlink(
+            &self,
+            _ctx: Context,
+            _linkname: &CStr,
+            _parent: Self::Inode,
+            _name: &CStr,
+            _extensions: Extensions,
+        ) -> io::Result<Entry> {
+            self.symlink_called.store(true, Ordering::SeqCst);
+            Err(io::Error::from_raw_os_error(libc::ENOSYS))
+        }
+
+        fn readlink(
+            &self,
+            _ctx: Context,
+            _inode: Self::Inode,
+        ) -> io::Result<Vec<u8>> {
+            self.readlink_called.store(true, Ordering::SeqCst);
+            Ok(b"safe-target".to_vec())
+        }
+
+        fn opendir(
+            &self,
+            _ctx: Context,
+            _inode: Self::Inode,
+            _flags: u32,
+        ) -> io::Result<(Option<Self::Handle>, OpenOptions)> {
+            self.opendir_called.store(true, Ordering::SeqCst);
+            Err(io::Error::from_raw_os_error(libc::ENOSYS))
+        }
+
+        fn readdir(
+            &self,
+            _ctx: Context,
+            _inode: Self::Inode,
+            _handle: Self::Handle,
+            _size: u32,
+            _offset: u64,
+        ) -> io::Result<Self::DirIter> {
+            self.readdir_called.store(true, Ordering::SeqCst);
+            Ok(EmptyDirIter)
+        }
+    }
+
+    fn test_context() -> Context {
+        Context {
+            uid: 0.into(),
+            gid: 0.into(),
+            pid: 1,
+        }
+    }
+
+    #[test]
+    fn denied_symlink_does_not_reach_inner_filesystem() {
+        let mut config = FilterConfig::default();
+        config.operations.allow_symlink = false;
+
+        let called = Arc::new(AtomicBool::new(false));
+        let inner = RecordingFs {
+            symlink_called: Arc::clone(&called),
+            readlink_called: Arc::new(AtomicBool::new(false)),
+            opendir_called: Arc::new(AtomicBool::new(false)),
+            readdir_called: Arc::new(AtomicBool::new(false)),
+        };
+
+        let fs = FilteredFs::new(
+            inner,
+            PolicyEngine::from_config(&config),
+            AuditLogger::disabled(),
+        );
+
+        let target = CStr::from_bytes_with_nul(b"safe-target\0").unwrap();
+        let name = CStr::from_bytes_with_nul(b"normal-link\0").unwrap();
+
+        let result = fs.symlink(
+            test_context(),
+            target,
+            1,
+            name,
+            Extensions::default(),
+        );
+
+        assert!(result.is_err(), "the denied operation should return an error");
+        assert!(
+            !called.load(Ordering::SeqCst),
+            "a denied symlink must not reach the underlying filesystem"
+        );
+    }
+
+    #[test]
+    fn allowed_symlink_reaches_inner_filesystem() {
+        let config = FilterConfig::default();
+
+        let called = Arc::new(AtomicBool::new(false));
+        let inner = RecordingFs {
+            symlink_called: Arc::clone(&called),
+            readlink_called: Arc::new(AtomicBool::new(false)),
+            opendir_called: Arc::new(AtomicBool::new(false)),
+            readdir_called: Arc::new(AtomicBool::new(false)),
+        };
+
+        let fs = FilteredFs::new(
+            inner,
+            PolicyEngine::from_config(&config),
+            AuditLogger::disabled(),
+        );
+
+        let target = CStr::from_bytes_with_nul(b"safe-target\0").unwrap();
+        let name = CStr::from_bytes_with_nul(b"normal-link\0").unwrap();
+
+        let result = fs.symlink(
+            test_context(),
+            target,
+            1,
+            name,
+            Extensions::default(),
+        );
+
+        assert!(
+            called.load(Ordering::SeqCst),
+            "an allowed symlink should reach the underlying filesystem"
+        );
+
+        match result {
+            Err(error) => assert_eq!(error.raw_os_error(), Some(libc::ENOSYS)),
+            Ok(_) => panic!("the fake filesystem is expected to return ENOSYS"),
+        }
+    }
+
+    #[test]
+    fn disabled_read_policy_blocks_readlink_and_readdir() {
+        let mut config = FilterConfig::default();
+        config.operations.allow_read = false;
+
+        let readlink_called = Arc::new(AtomicBool::new(false));
+        let readdir_called = Arc::new(AtomicBool::new(false));
+
+        let inner = RecordingFs {
+            symlink_called: Arc::new(AtomicBool::new(false)),
+            readlink_called: Arc::clone(&readlink_called),
+            opendir_called: Arc::new(AtomicBool::new(false)),
+            readdir_called: Arc::clone(&readdir_called),
+        };
+
+        let fs = FilteredFs::new(
+            inner,
+            PolicyEngine::from_config(&config),
+            AuditLogger::disabled(),
+        );
+
+        assert!(fs.readlink(test_context(), 1).is_err());
+        assert!(!readlink_called.load(Ordering::SeqCst));
+
+        assert!(fs.readdir(test_context(), 1, 2, 4096, 0).is_err());
+        assert!(!readdir_called.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn disabled_open_policy_blocks_opendir() {
+        let mut config = FilterConfig::default();
+        config.operations.allow_open = false;
+
+        let opendir_called = Arc::new(AtomicBool::new(false));
+
+        let inner = RecordingFs {
+            symlink_called: Arc::new(AtomicBool::new(false)),
+            readlink_called: Arc::new(AtomicBool::new(false)),
+            opendir_called: Arc::clone(&opendir_called),
+            readdir_called: Arc::new(AtomicBool::new(false)),
+        };
+
+        let fs = FilteredFs::new(
+            inner,
+            PolicyEngine::from_config(&config),
+            AuditLogger::disabled(),
+        );
+
+        assert!(fs.opendir(test_context(), 1, 0).is_err());
+        assert!(!opendir_called.load(Ordering::SeqCst));
+    }
+
 }
