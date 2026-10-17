@@ -732,6 +732,22 @@ mod tests {
     // ─── PolicyEngine: symlink policy ────────────────────────────────────────
 
     #[test]
+    fn test_symlink_absolute_name_rejected() {
+        let e = default_engine();
+
+        // Test the symlink entry name, not the symlink target.
+        assert!(e
+            .check_symlink(2, b"/tmp/host-marker", b"safe-target")
+            .is_deny());
+
+        // A normal name and relative target should still be allowed.
+        assert_eq!(
+            e.check_symlink(2, b"normal-link", b"safe-target"),
+            Verdict::Allow
+        );
+    }
+
+    #[test]
     fn test_symlink_absolute_denied() {
         let mut cfg = FilterConfig::default();
         cfg.symlink.allow_absolute_targets = false;

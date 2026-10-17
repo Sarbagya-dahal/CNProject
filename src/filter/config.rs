@@ -99,7 +99,7 @@ pub struct OperationsConfig {
     pub allow_write: bool,
     /// Opcode::Open, Opcode::Opendir
     pub allow_open: bool,
-    /// Opcode::Create, Opcode::Mknod, Opcode::Mkdir, Opcode::Tmpfile
+    /// Opcode::Create, Opcode::Mknod, Opcode::Mkdir. TMPFILE is unsupported by the current server/backend.
     pub allow_create: bool,
     /// Opcode::Unlink, Opcode::Rmdir
     pub allow_delete: bool,

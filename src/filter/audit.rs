@@ -42,6 +42,7 @@ pub enum OpKind {
     Fsync = 22,
     Fsyncdir = 23,
     Tmpfile = 24,
+    Readdir = 25,
     Other = 255,
 }
 
@@ -73,6 +74,7 @@ impl OpKind {
             OpKind::Fsync => "fsync",
             OpKind::Fsyncdir => "fsyncdir",
             OpKind::Tmpfile => "tmpfile",
+            OpKind::Readdir => "readdir",
             OpKind::Other => "other",
         }
     }
